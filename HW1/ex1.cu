@@ -1,19 +1,18 @@
 #include "ex1.h"
 
-__device__ void prefix_sum(int arr[], int arr_size) {
+__global__ void prefix_sum(int arr[], int arr_size) {
     int tid = threadIdx.x;
     int increment;
-    for(int stride = 1; stride < blockDim.x; stride *= 2) {
-        if(tid >= stride) {
+    for (int stride = 1; stride < blockDim.x; stride *= 2) {
+        if (tid >= stride) {
             increment = arr[tid - stride];
         }
         __syncthreads();
-        if(tid >= stride) {
+        if (tid >= stride) {
             arr[tid] += increment;
         }
+        __syncthreads();
     }
-    __syncthreads();
-    return; // TODO
 }
 
 /**
