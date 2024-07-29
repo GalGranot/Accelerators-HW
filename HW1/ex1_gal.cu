@@ -16,34 +16,41 @@
 /*=============================================================================
 * helper functions
 =============================================================================*/
-__device__ inline int calc_offset(int i) { return }
-__device__
-void compute_histograms(uchar *img, int histograms[TILES][COLOR_RANGE]) {
+__device__ void compute_histograms(uchar *img, int histograms[COLOR_RANGE], int tile)
+{
     int tid = threadIdx.x;
     for (int i = 0; i < TILES; i++) {
         if(tid < COLOR_RANGE) {
-            histograms[i][tid] = 0; //FIXME: assuming #threads > COLOR_RANGE
+            histograms[tid] = 0; //#threads > COLOR_RANGE
         }
     }
     __syncthreads();
+    int left = (tile % TILE_COUNT) * TILE_WIDTH;
+    int top = (tile % TILE_COUNT) * TILE_WIDTH;
     /*
     each thread needs to: 
         1. read a pixel value
         2. learn its block index
         3. atomic write to appropriate histogram
     */
-   
-   //FIXME: isn't correct right now
-    for (int i = 0; i < TILES; i++) { 
-        int line_offset = ((int)std::round(i / TILES_PER_LINE)) * IMG_WIDTH;
-        int tile_offset = (i % TILES_PER_LINE) * TILE_WIDTH;
-        //FIXME: need to add thread offset inside tile and disperse threads
-        // throughout tile while dropping lines when appropriate
-        int offset = line_offset + tile_offset /*+thread offset*/; 
-        int value = img[offset];
+    int pixels_per_thread = PIXELS_PER_TILE / THREAD_NUM;
+    for(int i = tid * pixels_per_thread; i < (tid + 1) * pixels_per_thread; i++) {
+        int x = left + (i % TILE_WIDTH);
+        int y = top + (i % TILE_WIDTH);
+        int index = x + y * IMG_WIDTH;
+        atomicAdd(&histograms[img[index]], 1);
+    }
+    __syncthreads();
+}
 
-        int tile; //FIXME: calc correct tile
-        atomicAdd_block(&histograms[tile][value], 1);
+__device__ void compute_map(int cdf[COLOR_RANGE], uchar *maps)
+{
+    int tid = threadIdx.x;
+    for(int i = 0; i < COLOR_RANGE; i++) {
+        if(tid < COLOR_RANGE) {
+            double map_val = ((float(cdf[tid])) * (COLOR_RANGE - 1)) / PIXELS_PER_TILE;
+            maps[tid] = (uchar)map_val;
+        }
     }
     __syncthreads();
 }
@@ -86,14 +93,33 @@ __global__ void process_image_kernel(uchar *all_in, uchar *all_out, uchar *maps)
         4. compute map from each pixel value to another
         5. interpolate_device() and return
     */
-    __shared__ int histograms[TILE_COUNT][COLOR_RANGE];
-    interpolate_device(maps, all_in, all_out);
+    int bx = blockIdx.x;
+    int index = bx * IMG_WIDTH * IMG_HEIGHT;
+
+    for(int tile = 0; tile < TILES; tile++) {
+        __shared__ int histogram[COLOR_RANGE];
+        compute_histograms(&all_in[index], histogram, tile);
+        __syncthreads();
+        prefix_sum(histograms, COLOR_RANGE); //compute CDF
+        __syncthreads();
+        compute_map(histogram, &maps[(bx * TILES + tile) * COLOR_RANGE]);
+        __syncthreads();
+    }
+    __syncthreads();
+    interpolate_device(&maps[bx * TILES * COLOR_RANGE], &all_in[index], &all_out[index]);
+    __syncthreads();
+
     return;
 }
 
+/*=============================================================================
+* task structs/funcs
+=============================================================================*/
 /* Task serial context struct with necessary CPU / GPU pointers to process a single image */
 struct task_serial_context {
-    // TODO define task serial memory buffers
+    uchar *d_all_in;
+    uchar *d_all_out;
+    uchar *d_maps;
 };
 
 /* Allocate GPU memory for a single input image and a single output image.
@@ -102,8 +128,13 @@ struct task_serial_context {
 struct task_serial_context *task_serial_init()
 {
     auto context = new task_serial_context;
-
     //TODO: allocate GPU memory for a single input image, a single output image, and maps
+    int pixels = IMG_HEIGHT * IMG_WIDTH;
+    size_t image_size_bytes = pixels * sizeof(uchar);
+    size_t maps_size_bytes = TILES * COLOR_RANGE * sizeof(uchar);
+    CUDA_CHECK(cudaMalloc((void**)&context->d_all_in), image_size_bytes);
+    CUDA_CHECK(cudaMalloc((void**)&context->d_all_out), image_size_bytes);
+    CUDA_CHECK(cudaMalloc((void**)&context->d_maps), maps_size_bytes);
 
     return context;
 }
@@ -116,13 +147,33 @@ void task_serial_process(struct task_serial_context *context, uchar *images_in, 
     //   1. copy the relevant image from images_in to the GPU memory you allocated
     //   2. invoke GPU kernel on this image
     //   3. copy output from GPU memory to relevant location in images_out_gpu_serial
+
+    size_t size = IMG_HEIGHT * IMG_WIDTH;
+    for(int img = 0; img < N_IMAGES; i++) {
+        CUDA_CHECK(cudaMemcpy(
+            context->d_all_in,
+            &images_in[img * size],
+            size * sizeof(uchar), 
+            cudaMemcpyHostToDevice)
+        );
+        process_image_kernel<<<1, THREAD_NUM>>>(context->d_all_in, context->d_all_out, context->d_maps);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        CUDA_CHECK(cudaMemcpy(
+            &images_out[img * size],
+            context->d_all_out,
+            size * sizeof(uchar),
+            cudaMemcpyDeviceToHost)
+        );
+    }
 }
 
 /* Release allocated resources for the task-serial implementation. */
 void task_serial_free(struct task_serial_context *context)
 {
     //TODO: free resources allocated in task_serial_init
-
+    CUDA_CHECK(cudaFree(context->d_all_in));
+    CUDA_CHECK(cudaFree(context->d_all_out));
+    CUDA_CHECK(cudaFree(context->d_maps));
     free(context);
 }
 

@@ -21,7 +21,7 @@ ex1: ex1.o main.o ex1-cpu.o
 image: ex1-cpu.o image.o
 	nvcc --link $(CFLAGS) $^ -o $@
 
-ex1.o: ex1.cu ex1.h
+ex1.o: ex1_gal.cu ex1.h
 main.o: main.cu ex1.h
 image.o: image.cu ex1.h
 
