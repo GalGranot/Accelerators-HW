@@ -8,7 +8,9 @@
 #define TILES TILE_COUNT * TILE_COUNT
 #define PIXELS_PER_TILE TILE_WIDTH * TILE_WIDTH
 #define TILES_PER_LINE TILE_COUNT
-#define THREAD_NUM 256
+#define STREAM_THREAD_NUM 1024
+
+#define STREAMS_NUM 64
 
 /*=============================================================================
 * helper functions
@@ -126,48 +128,86 @@ __global__ void process_image_kernel(uchar *in, uchar *out, uchar* maps) {
     process_image(in, out, maps);
 }
 
+struct Active_Stream
+{
+    cudaStream_t* stream;
+    int* img_id;
+    Active_Stream(cudaStream_t* steam, int img_id_val) : stream(stream)
+    {
+        img_id = new int(img_id_val);
+    }
+    void activate()
+    { 
+        process_image_kernel<<<1, STREAM_THREAD_NUMTHREAD_NUM>>>(); //!FIXME how to call this?
+    }
+    ~Active_Stream() { delete img_id; }
+};
+
 class streams_server : public image_processing_server
 {
 private:
     // TODO define stream server context (memory buffers, streams, etc...)
+    cudaStream_t streams[STREAMS_NUM];
+    std::unordered_set<Active_Stream> active_streams;
 
 public:
     streams_server()
     {
         // TODO initialize context (memory buffers, streams, etc...)
+        for(cudaStream_t& stream : streams) {
+            CUDA_CHECK(cudaStreamCreate(&stream));
+        }
     }
 
     ~streams_server() override
     {
-        // TODO free resources allocated in constructor
+        for(cudaStream_t& stream : streams) {
+            CUDA_CHECK(cudaStreamDestroy(&stream));
+        }
     }
 
     bool enqueue(int img_id, uchar *img_in, uchar *img_out) override
     {
         // TODO place memory transfers and kernel invocation in streams if possible.
+        for(cudaStream_t& stream : streams) {
+            cudaError_t query = cudaStreamQuery(stream);
+            if(query == cudaErrorNotReady) {
+                continue;
+            }
+            else if(query == cudaSuccess) {
+                Active_Stream active_stream(&stream, img_id);
+                active_stream.insert(active_stream);
+                active_stream.activate();
+                return true;
+            }
+            else {
+                CUDA_CHECK(query);
+            }
+        }
         return false;
     }
 
     bool dequeue(int *img_id) override
     {
-        return false;
-
-        // TODO query (don't block) streams for any completed requests.
-        //for ()
-        //{
-            cudaError_t status = cudaStreamQuery(0); // TODO query diffrent stream each iteration
-            switch (status) {
-            case cudaSuccess:
-                // TODO return the img_id of the request that was completed.
-                //*img_id = ...
-                return true;
-            case cudaErrorNotReady:
-                return false;
-            default:
-                CUDA_CHECK(status);
-                return false;
+        if(active_streams.empty()) {
+            return false;
+        }
+        //!FIXME maybe they meant querying a single stream here?
+        for(cudaStream_t& active_stream : active_streams) {
+            cudaError_t query = cudaStreamQuery(*(active_stream.stream));
+            if(cudaErrorNotReady == query) {
+                continue;
             }
-        //}
+            else if(query == cudaSuccess) {
+                *img_id = *(active_stream.img_id);
+                active_streams.erase(active_stream);
+                return true;
+            }
+            else {
+                CUDA_CHECK(query);
+            }
+        }
+        return false;
     }
 };
 

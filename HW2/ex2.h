@@ -7,6 +7,7 @@
 #include <time.h>
 
 #include <memory>
+#include <unordered_set>
 
 #define IMG_HEIGHT 128
 #define IMG_WIDTH 128
