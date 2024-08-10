@@ -10,18 +10,6 @@
 #define TILES_PER_LINE TILE_COUNT
 #define THREAD_NUM 256
 
-#define N_STREAMS 64
-#define N_THREADS_STREAMS_MODE 1024
-#define INVALID_IMG_ID -1
-
-#define dbg 1
-#if dbg
-    #include <iostream>
-#endif
-
-size_t img_size = IMG_HEIGHT * IMG_WIDTH * sizeof(uchar);
-size_t map_size = TILES * COLOR_RANGE * sizeof(uchar);
-
 /*=============================================================================
 * helper functions
 =============================================================================*/
@@ -51,7 +39,7 @@ __device__ void compute_histograms(uchar *img, int histograms[COLOR_RANGE], int 
 }
 
 
-__device__ void compute_map(int cdf[COLOR_RANGE],uchar *maps) {
+__device__ void compute_map(int cdf[COLOR_RANGE],uchar *maps){
     int tid = threadIdx.x;
     for(int i=0; i<COLOR_RANGE; i++){    
         if (tid<COLOR_RANGE)
@@ -91,12 +79,11 @@ __device__ void prefix_sum(int arr[], int arr_size)
  * @param in_img single input image, in global memory.
  * @param out_img single output buffer, in global memory.
  */
-__device__
- void interpolate_device(uchar* maps ,uchar *in_img, uchar* out_img);
+__device__ void interpolate_device(uchar* maps ,uchar *in_img, uchar* out_img);
 
-__device__
-void process_image(uchar *in, uchar *out, uchar* maps) {
-        /* steps:
+__device__ void process_image(uchar *in, uchar *out, uchar* maps) {
+    
+    /* steps:
         1. divide image into tiles
         2. compute histogram for each tile
         3. compute cdf for each histogram
@@ -114,7 +101,7 @@ void process_image(uchar *in, uchar *out, uchar* maps) {
         //shared memory 
         __shared__ int histogram [COLOR_RANGE];
         //compute the histogram for each tile
-        compute_histograms(&in[index], histogram, tile);
+        compute_histograms(&all_in[index], histogram, tile);
         __syncthreads();
 
         //compute CDF for each histogram
@@ -129,45 +116,36 @@ void process_image(uchar *in, uchar *out, uchar* maps) {
    __syncthreads();
 
    //interpolate device
-    interpolate_device(&maps[bx*TILES*COLOR_RANGE], &in[index], &out[index]);
+    interpolate_device(&maps[bx*TILES*COLOR_RANGE], &all_in[index], &all_out[index]);
     __syncthreads();
     return; 
 }
 
-__global__
-void process_image_kernel(uchar *in, uchar *out, uchar* maps) {
+__global__ void process_image_kernel(uchar *in, uchar *out, uchar* maps) {
     process_image(in, out, maps);
 }
 
-struct stream_gpu_buffer
+struct Active_Stream
 {
-    int img_id;
-    uchar *img_in;
-    uchar *img_out;
-    uchar *map;
-    bool active;
-    stream_gpu_buffer() : img_id(INVALID_IMG_ID), img_in(NULL), img_out(NULL), map(NULL), active(false) {}
+    cudaStream_t* stream;
+    int* img_id;
+    Active_Stream(cudaStream_t* steam, int img_id_val) : stream(stream)
+    {
+        img_id = new int(img_id_val);
+    }
+    void activate()
+    { 
+        process_image_kernel<<<1, STREAM_THREAD_NUMTHREAD_NUM>>>(); //!FIXME how to call this?
+    }
+    ~Active_Stream() { delete img_id; }
 };
-
-//! FIXME maybe we should not alloc and dealloc every img?
-void alloc_gpu_buffer(stream_gpu_buffer& buffer, cudaStream_t& stream) {
-    CUDA_CHECK(cudaMallocAsync((void**)&(buffer.img_in), img_size, stream));
-    CUDA_CHECK(cudaMallocAsync((void**)&(buffer.img_out), img_size, stream));
-    CUDA_CHECK(cudaMallocAsync((void**)&(buffer.map), map_size, stream));
-}
-
-void dealloc_gpu_buffer(stream_gpu_buffer& buffer, cudaStream_t& stream) {
-    CUDA_CHECK(cudaFreeAsync(buffer.img_in, stream));
-    CUDA_CHECK(cudaFreeAsync(buffer.img_out, stream));
-    CUDA_CHECK(cudaFreeAsync(buffer.map, stream));
-}
 
 class streams_server : public image_processing_server
 {
 private:
     // TODO define stream server context (memory buffers, streams, etc...)
-    cudaStream_t streams[N_STREAMS];
-    stream_gpu_buffer gpu_buffers[N_STREAMS];
+    cudaStream_t streams[STREAMS_NUM];
+    std::unordered_set<Active_Stream> active_streams;
 
 public:
     streams_server()
@@ -180,84 +158,49 @@ public:
 
     ~streams_server() override
     {
-        // TODO free resources allocated in constructor
         for(cudaStream_t& stream : streams) {
-            CUDA_CHECK(cudaStreamDestroy(stream));
+            CUDA_CHECK(cudaStreamDestroy(&stream));
         }
     }
-    #if dbg
-    int enqueueNum = 0;
-    #endif
+
     bool enqueue(int img_id, uchar *img_in, uchar *img_out) override
     {
         // TODO place memory transfers and kernel invocation in streams if possible.
-        /* task list:
-        1. try and find an empty stream (if can't - return false)
-        2. memcpy on found stream
-        3. call kernel on found stream
-        4. associate kernel with img_id
-        */
-        //!FIXME - efficiently find next available stream with queue
-        #if dbg
-            std::cout << "enqueue num " << enqueueNum++ << std::endl;
-        #endif
-        for(int i = 0; i < N_STREAMS; i++) {
-            cudaStream_t& stream = streams[i];
-            stream_gpu_buffer& buff = gpu_buffers[i];
+        for(cudaStream_t& stream : streams) {
             cudaError_t query = cudaStreamQuery(stream);
-            switch(query) {
-            case cudaErrorNotReady:
-                std::cout << "stream " << i << " not free" << std::endl;
+            if(query == cudaErrorNotReady) {
                 continue;
-                break;
-
-            case cudaSuccess:
-                std::cout << "stream " << i << " free, enqueuing" << std::endl;
-                alloc_gpu_buffer(buff, stream);
-                buff.img_id = img_id;
-                buff.active = true;
-                CUDA_CHECK(cudaMemcpyAsync(buff.img_in, img_in, img_size, cudaMemcpyHostToDevice, stream));
-                std::cout << "before kernel" << std::endl;
-                process_image_kernel<<<1, N_THREADS_STREAMS_MODE, 0, stream>>>(buff.img_in, buff.img_out, buff.map);
-                std::cout << "after kernel" << std::endl;
-                CUDA_CHECK(cudaMemcpyAsync(img_out, buff.img_out, img_size, cudaMemcpyHostToDevice, stream));
+            }
+            else if(query == cudaSuccess) {
+                Active_Stream active_stream(&stream, img_id);
+                active_stream.insert(active_stream);
+                active_stream.activate();
                 return true;
-                break;
-
-            default:
+            }
+            else {
                 CUDA_CHECK(query);
             }
         }
         return false;
     }
-    #if dbg
-        int dequeueNum = 0;
-    #endif
+
     bool dequeue(int *img_id) override
     {
-        #if dbg 
-            std::cout << "dequeue " << dequeueNum++ << std::endl;
-        #endif
-        for(int i = 0; i < N_STREAMS; i++) {
-            cudaStream_t& stream = streams[i];
-            stream_gpu_buffer& buff = gpu_buffers[i];
-            cudaError_t query = cudaStreamQuery(stream);
-            switch(query) {
-            case cudaErrorNotReady:
+        if(active_streams.empty()) {
+            return false;
+        }
+        //!FIXME maybe they meant querying a single stream here?
+        for(cudaStream_t& active_stream : active_streams) {
+            cudaError_t query = cudaStreamQuery(*(active_stream.stream));
+            if(cudaErrorNotReady == query) {
                 continue;
-                break;
-
-            case cudaSuccess:
-                if(!buff.active) {
-                    continue;
-                }
-                buff.active = false;
-                *img_id = buff.img_id;
-                dealloc_gpu_buffer(buff, stream);
+            }
+            else if(query == cudaSuccess) {
+                *img_id = *(active_stream.img_id);
+                active_streams.erase(active_stream);
                 return true;
-                break;
-
-            default:
+            }
+            else {
                 CUDA_CHECK(query);
             }
         }
