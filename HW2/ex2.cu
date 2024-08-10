@@ -139,52 +139,47 @@ void process_image_kernel(uchar *in, uchar *out, uchar* maps) {
     process_image(in, out, maps);
 }
 
-struct stream_gpu_buffer
+struct StreamData
 {
+    cudaStream_t stream;
+    uchar *d_in;
+    uchar *d_out;
+    uchar *d_map;
     int img_id;
-    uchar *img_in;
-    uchar *img_out;
-    uchar *map;
-    bool active;
-    stream_gpu_buffer() : img_id(INVALID_IMG_ID), img_in(NULL), img_out(NULL), map(NULL), active(false) {}
 };
-
-//! FIXME maybe we should not alloc and dealloc every img?
-void alloc_gpu_buffer(stream_gpu_buffer& buffer, cudaStream_t& stream) {
-    CUDA_CHECK(cudaMallocAsync((void**)&(buffer.img_in), img_size, stream));
-    CUDA_CHECK(cudaMallocAsync((void**)&(buffer.img_out), img_size, stream));
-    CUDA_CHECK(cudaMallocAsync((void**)&(buffer.map), map_size, stream));
-}
-
-void dealloc_gpu_buffer(stream_gpu_buffer& buffer, cudaStream_t& stream) {
-    CUDA_CHECK(cudaFreeAsync(buffer.img_in, stream));
-    CUDA_CHECK(cudaFreeAsync(buffer.img_out, stream));
-    CUDA_CHECK(cudaFreeAsync(buffer.map, stream));
-}
 
 class streams_server : public image_processing_server
 {
 private:
     // TODO define stream server context (memory buffers, streams, etc...)
-    cudaStream_t streams[N_STREAMS];
-    stream_gpu_buffer gpu_buffers[N_STREAMS];
+    StreamData streams[N_STREAMS];
 
 public:
     streams_server()
     {
         // TODO initialize context (memory buffers, streams, etc...)
-        for(cudaStream_t& stream : streams) {
-            CUDA_CHECK(cudaStreamCreate(&stream));
+        for(int i = 0; i < N_STREAMS; i++) {
+            StreamData& data = streams[i];
+            CUDA_CHECK(cudaStreamCreate(&(data.stream)));
+            CUDA_CHECK(cudaMalloc((void**)&(data.d_in), img_size));
+            CUDA_CHECK(cudaMalloc((void**)&(data.d_out), img_size));
+            CUDA_CHECK(cudaMalloc((void**)&(data.d_map), map_size));
+            data.img_id = INVALID_IMG_ID;
         }
     }
 
     ~streams_server() override
     {
         // TODO free resources allocated in constructor
-        for(cudaStream_t& stream : streams) {
-            CUDA_CHECK(cudaStreamDestroy(stream));
+        for(int i = 0; i < N_STREAMS; i++) {
+            StreamData& data = streams[i];
+            CUDA_CHECK(cudaStreamDestroy(data.stream));
+            CUDA_CHECK(cudaFree(data.d_in));
+            CUDA_CHECK(cudaFree(data.d_out));
+            CUDA_CHECK(cudaFree(data.d_map));
         }
     }
+    
     #if dbg
     int enqueueNum = 0;
     #endif
@@ -197,36 +192,16 @@ public:
         3. call kernel on found stream
         4. associate kernel with img_id
         */
-        //!FIXME - efficiently find next available stream with queue
-        #if dbg
-            std::cout << "enqueue num " << enqueueNum++ << std::endl;
-        #endif
         for(int i = 0; i < N_STREAMS; i++) {
-            cudaStream_t& stream = streams[i];
-            stream_gpu_buffer& buff = gpu_buffers[i];
-            cudaError_t query = cudaStreamQuery(stream);
-            switch(query) {
-            case cudaErrorNotReady:
-                std::cout << "stream " << i << " not free" << std::endl;
+            StreamData& data = streams[i];
+            if(data.img_id != INVALID_IMG_ID || cudaStreamQuery(data.stream) == cudaErrorNotReady) {
                 continue;
-                break;
-
-            case cudaSuccess:
-                std::cout << "stream " << i << " free, enqueuing" << std::endl;
-                alloc_gpu_buffer(buff, stream);
-                buff.img_id = img_id;
-                buff.active = true;
-                CUDA_CHECK(cudaMemcpyAsync(buff.img_in, img_in, img_size, cudaMemcpyHostToDevice, stream));
-                std::cout << "before kernel" << std::endl;
-                process_image_kernel<<<1, N_THREADS_STREAMS_MODE, 0, stream>>>(buff.img_in, buff.img_out, buff.map);
-                std::cout << "after kernel" << std::endl;
-                CUDA_CHECK(cudaMemcpyAsync(img_out, buff.img_out, img_size, cudaMemcpyHostToDevice, stream));
-                return true;
-                break;
-
-            default:
-                CUDA_CHECK(query);
             }
+            CUDA_CHECK(cudaMemcpyAsync(data.d_in, img_in, img_size, cudaMemcpyHostToDevice, data.stream));
+            process_image_kernel<<<1, N_THREADS_STREAMS_MODE, 0, data.stream>>>(data.d_in, data.d_out, data.d_map);
+            CUDA_CHECK(cudaMemcpyAsync(img_out, data.d_out, img_size, cudaMemcpyDeviceToHost, data.stream));
+            data.img_id = img_id;
+            return true;
         }
         return false;
     }
@@ -235,30 +210,24 @@ public:
     #endif
     bool dequeue(int *img_id) override
     {
-        #if dbg 
-            std::cout << "dequeue " << dequeueNum++ << std::endl;
-        #endif
         for(int i = 0; i < N_STREAMS; i++) {
-            cudaStream_t& stream = streams[i];
-            stream_gpu_buffer& buff = gpu_buffers[i];
-            cudaError_t query = cudaStreamQuery(stream);
+            StreamData& data = streams[i];
+            if(data.img_id == INVALID_IMG_ID) {
+                continue;
+            }
+            cudaError_t query = cudaStreamQuery(data.stream);
             switch(query) {
+            case cudaSuccess:
+                *img_id = data.img_id;
+                data.img_id = INVALID_IMG_ID;
+                return true;
+            
             case cudaErrorNotReady:
                 continue;
-                break;
-
-            case cudaSuccess:
-                if(!buff.active) {
-                    continue;
-                }
-                buff.active = false;
-                *img_id = buff.img_id;
-                dealloc_gpu_buffer(buff, stream);
-                return true;
-                break;
-
+            
             default:
                 CUDA_CHECK(query);
+                return false;
             }
         }
         return false;
